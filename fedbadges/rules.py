@@ -21,6 +21,7 @@ import fedmsg.meta
 import fedmsg.encoding
 import datanommer.models
 
+from badgrclient import BadgeClass
 from fedbadges.utils import (
     # These are all in-process utilities
     construct_substitutions,
@@ -32,7 +33,9 @@ from fedbadges.utils import (
 
     # These make networked API calls
     user_exists_in_fas,
+    assertion_exists
 )
+from fedora_messaging.config import conf
 
 import logging
 log = logging.getLogger('moksha.hub')
@@ -73,9 +76,6 @@ operator_lookup = {
     "not": lambda x: all([not item for item in x])
 }
 
-fedmsg_config = fedmsg.config.load_config()
-fedmsg.meta.make_processors(**fedmsg_config)
-
 
 class BadgeRule(object):
     required = frozenset([
@@ -106,7 +106,7 @@ class BadgeRule(object):
         'taskotron',
     ])
 
-    def __init__(self, badge_dict, tahrir_database, issuer_id):
+    def __init__(self, badge_dict, badgr_client, issuer_id):
         argued_fields = frozenset(badge_dict.keys())
 
         if not argued_fields.issubset(self.possible):
@@ -124,19 +124,24 @@ class BadgeRule(object):
                 ))
 
         self._d = badge_dict
+        self.client = badgr_client
 
-        self.tahrir = tahrir_database
-        if self.tahrir:
-            transaction.begin()
-            self.badge_id = self._d['badge_id'] = self.tahrir.add_badge(
-                name=self._d['name'],
-                image=self._d['image_url'],
-                desc=self._d['description'],
-                criteria=self._d['discussion'],
-                tags=','.join(self._d.get('tags', [])),
-                issuer_id=issuer_id,
-            )
-            transaction.commit()
+        if self.client:
+            badge_name = self._d['name']
+            badge_id = self.client.get_eid_from_badge_name(badge_name, issuer_id)
+            if badge_id:
+                self.badge_id = badge_id
+            else:
+                badge = BadgeClass(self.client).create(
+                    name=badge_name,
+                    image='TODO',
+                    description=self._d['description'],
+                    issuer_eid=self.issuer_id,
+                    criteria_url=self._d['discussion'],
+                    tags=self._d.get('tags', []),
+                )
+
+                self.badge_id = badge.entityId
 
         self.trigger = Trigger(self._d['trigger'], self)
         self.criteria = Criteria(self._d['criteria'], self)
@@ -199,20 +204,20 @@ class BadgeRule(object):
 
             if self.recipient_nick2fas:
                 awardees = frozenset([
-                    nick2fas(nick, **fedmsg_config) for nick in awardees
+                    nick2fas(nick, **conf) for nick in awardees
                 ])
 
             if self.recipient_email2fas:
                 awardees = frozenset([
-                    email2fas(email, **fedmsg_config) for email in awardees
+                    email2fas(email, **conf) for email in awardees
                 ])
 
             if self.recipient_openid2fas:
                 awardees = frozenset([
-                    openid2fas(openid, **fedmsg_config) for openid in awardees
+                    openid2fas(openid, **conf) for openid in awardees
                 ])
         else:
-            usernames = fedmsg.meta.msg2usernames(msg)
+            usernames = msg.usernames
             awardees = usernames.difference(self.banned_usernames)
 
         # Strip anyone who is an IP address
@@ -230,19 +235,21 @@ class BadgeRule(object):
 
         # Limit awardees to only those who do not already have this badge.
         # Do this only if we have an active connection to the Tahrir DB.
-        if self.tahrir:
+        if self.client:
+            badge = BadgeClass(self.client, eid=self.badge_id)
             awardees = frozenset([
                 user for user in awardees
-                if not self.tahrir.assertion_exists(
-                    self.badge_id, "%s@fedoraproject.org" % user
+                if not assertion_exists(
+                    badge, "%s@fedoraproject.org" % user
                 )])
 
+            # TODO: How?
             # Also, exclude any potential awardees who have opted out.
-            awardees = frozenset([
-                user for user in awardees
-                if not self.tahrir.person_opted_out(
-                    "%s@fedoraproject.org" % user
-                )])
+            # awardees = frozenset([
+            #     user for user in awardees
+            #     if not self.client.person_opted_out(
+            #         "%s@fedoraproject.org" % user
+            #     )])
 
         # If no-one would get the badge at this point, then no reason to waste
         # time doing any further checks.  No need to query datanommer.
@@ -261,7 +268,7 @@ class BadgeRule(object):
         # actually has a FAS account before we award anything.
         # https://github.com/fedora-infra/tahrir/issues/225
         awardees = set([
-            u for u in awardees if user_exists_in_fas(fedmsg_config, u)
+            u for u in awardees if user_exists_in_fas(conf, u)
         ])
 
         return awardees

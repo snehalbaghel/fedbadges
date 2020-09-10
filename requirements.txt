@@ -1,9 +1,11 @@
-tahrir-api
-fedmsg
+# tahrir-api
+# fedmsg
 fedmsg_meta_fedora_infrastructure
 PyYAML
 datanommer.models
-zope.sqlalchemy
+# zope.sqlalchemy
 requests
 psutil
-moksha
+# moksha
+badgrclient
+fedora-messaging

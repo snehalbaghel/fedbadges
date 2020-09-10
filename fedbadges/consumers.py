@@ -12,11 +12,11 @@ import transaction
 import threading
 import time
 
-import fedmsg.consumers
-
-import tahrir_api.dbapi
 import datanommer.models
+from fedora_messaging.config import conf
 
+
+from badgrclient import BadgrClient, Assertion, BadgeClass
 from sqlalchemy import create_engine
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker, scoped_session
@@ -26,25 +26,23 @@ import fedbadges.rules
 import fedbadges.utils
 
 import logging
-log = logging.getLogger("moksha.hub")
+log = logging.getLogger("fedora-messaging.fedbages")
 
+BADGR_SCOPE = 'rw:profile rw:issuer rw:backpack'
 
-class FedoraBadgesConsumer(fedmsg.consumers.FedmsgConsumer):
-    topic = "*"
-    config_key = "fedmsg.consumers.badges.enabled"
-    consume_delay = 3
-    delay_limit = 100
+class FedoraBadgesConsumer(object):
 
-    def __init__(self, hub):
+    def __init__(self):
         self.badge_rules = []
-        self.hub = hub
+        self.config = conf["consumer_config"]
 
-        super(FedoraBadgesConsumer, self).__init__(hub)
 
-        self.consume_delay = int(self.hub.config.get('badges.consume_delay',
-                                                     self.consume_delay))
-        self.delay_limit = int(self.hub.config.get('badges.delay_limit',
-                                                   self.delay_limit))
+        # super(FedoraBadgesConsumer, self).__init__(hub)
+
+        # self.consume_delay = int(self.hub.config.get('badges.consume_delay',
+        #                                              self.consume_delay))
+        # self.delay_limit = int(self.hub.config.get('badges.delay_limit',
+        #                                            self.delay_limit))
 
         # Five things need doing at start up time
         # 0) Set up a request local to hang thread-safe db sessions on.
@@ -57,49 +55,60 @@ class FedoraBadgesConsumer(fedmsg.consumers.FedmsgConsumer):
         # Thread-local stuff
         self.l = threading.local()
 
-        # Tahrir stuff.
-        self._initialize_tahrir_connection()
+        # Badgr stuff
+        self._initalize_badgr_connection()
 
         # Datanommer stuff
         self._initialize_datanommer_connection()
 
         # Load badge definitions
-        directory = hub.config.get("badges.yaml.directory", "badges_yaml_dir")
+        directory = self.config.get("badges_yaml_directory")
         self.badge_rules = self._load_badges_from_yaml(directory)
 
-    def _initialize_tahrir_connection(self):
-        if hasattr(self.l, 'tahrir'):
-            return
+    def _initalize_badgr_connection(self):
+        badgr_user = self.config.get('badgr_user')
 
-        global_settings = self.hub.config.get("badges_global", {})
+        required = frozenset(['username', 'password', 'client_id',
+            'base_url'])
 
-        database_uri = global_settings.get('database_uri')
-        if not database_uri:
-            raise ValueError('Badges consumer requires a database uri')
+        argued_fields = frozenset(badgr_user.keys())
+        
+        if not required.issubset(argued_fields):
+            raise ValueError('BadgrClient requires: {}, \
+                missing: {}'.format(required, required.difference(argued_fields)))
 
-        session_cls = scoped_session(sessionmaker(
-            extension=ZopeTransactionExtension(),
-            bind=create_engine(database_uri),
-        ))
+        username = badgr_user.get('username')
+        password = badgr_user.get('password')
+        client_id = badgr_user.get('client_id')
+        base_url = badgr_user.get('base_url')
 
-        self.l.tahrir = tahrir_api.dbapi.TahrirDatabase(
-            session=session_cls(),
-            autocommit=False,
-            notification_callback=fedbadges.utils.notification_callback,
+        self.l.badgr_client = BadgrClient(
+            username=username,
+            password=password,
+            client_id=client_id,
+            scope=BADGR_SCOPE,
+            base_url=base_url,
+            unique_badge_names=True
         )
-        issuer = global_settings.get('badge_issuer')
 
-        transaction.begin()
-        self.issuer_id = self.l.tahrir.add_issuer(
-            issuer.get('issuer_origin'),
-            issuer.get('issuer_name'),
-            issuer.get('issuer_org'),
-            issuer.get('issuer_contact')
-        )
-        transaction.commit()
+        issuer = self.config.get('badge_issuer')
+
+        issuer_eid = issuer.get('entity_id')
+
+        if (issuer_eid):
+            self.issuer_id = issuer_eid
+        else:
+            # TODO: create issuer
+            pass
+
+        if self.issuer_id:
+            self.l.badgr_client.load_badge_names(self.issuer_id)
+        else:
+            # TODO: throw an exception?
+            pass
 
     def _initialize_datanommer_connection(self):
-        datanommer.models.init(self.hub.config['datanommer.sqlalchemy.url'])
+        datanommer.models.init(self.config.get("datanommer_sqlalchemy_url"))
 
     def _load_badges_from_yaml(self, directory):
         # badges indexed by trigger
@@ -116,7 +125,7 @@ class FedoraBadgesConsumer(fedmsg.consumers.FedmsgConsumer):
 
                 try:
                     badge_rule = fedbadges.rules.BadgeRule(
-                        badge, self.l.tahrir, self.issuer_id)
+                        badge, self.l.badgr_client, self.issuer_id)
                     badges.append(badge_rule)
                 except ValueError as e:
                     log.error("Initializing rule for %r failed with %r" % (
@@ -149,23 +158,18 @@ class FedoraBadgesConsumer(fedmsg.consumers.FedmsgConsumer):
 
         log.info("Awarding badge %r to %r" % (badge_rule.badge_id, username))
         email = "%s@fedoraproject.org" % username
+        client = badge_rule.client
 
-        try:
-            transaction.begin()
-            self.l.tahrir.add_person(email)
-            transaction.commit()
-        except:
-            transaction.abort()
-            self.l.tahrir.session.rollback()
-            raise
+        # Check if the recipient already has been awarded
+        badge_to_award = BadgeClass(client, eid=badge_rule.badge_id)
+        badge_to_award.issue(recipient_email=email)
 
-        user = self.l.tahrir.get_person(email)
-
-        try:
-            transaction.begin()
-            self.l.tahrir.add_assertion(badge_rule.badge_id, email, None, link)
-            transaction.commit()
-        except IntegrityError:
+        # try:
+            # transaction.begin()
+            # self.l.tahrir.add_assertion(badge_rule.badge_id, email, None, link)
+            # transaction.commit()
+        # except IntegrityError:
+        # TODO: How?
             # Here we handle two different kinds of errors due to the existence
             # of a somewhat harmless race condition.
             # Say that someone adds 2 tags to a package in fedora-tagger all at
@@ -181,18 +185,18 @@ class FedoraBadgesConsumer(fedmsg.consumers.FedmsgConsumer):
             # IntegrityError.  We catch that here, and note it in the logs as a
             # warning not an error.  It happens often enough and is harmless
             # enough that we don't want to receive emails about it.
-            transaction.abort()
-            self.l.tahrir.session.rollback()
-            log.warn(traceback.format_exc())
-        except:
+            # transaction.abort()
+            # self.l.tahrir.session.rollback()
+            # log.warn(traceback.format_exc())
+        # except:
             # For all other errors, we rollback the transaction but we also
             # re-raise the error so that it hits the fedmsg handling in the
             # stack above and emails us about it.
-            transaction.abort()
-            self.l.tahrir.session.rollback()
-            raise
+            # transaction.abort()
+            # self.l.tahrir.session.rollback()
+            # raise
 
-    def consume(self, msg):
+    def __call__(self, msg):
 
         # First thing, we receive the message, but we put ourselves to sleep to
         # wait for a moment.  The reason for this is that, when things are
@@ -215,7 +219,7 @@ class FedoraBadgesConsumer(fedmsg.consumers.FedmsgConsumer):
         msg = msg['body']
 
         default = "https://apps.fedoraproject.org/datagrepper"
-        link = self.hub.config.get('fedbadges.datagrepper_url', default) + \
+        link = self.config.get('fedbadges_datagrepper_url', default) + \
             "/id?id=%s&is_raw=true&size=extra-large" % msg['msg_id']
 
         # Define this so we can refer to it in error handling below

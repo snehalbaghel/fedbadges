@@ -15,12 +15,10 @@ import utils
 
 class TestComplicatedRecipient(unittest.TestCase):
 
-    @patch('fedmsg.init')
     @patch('tahrir_api.dbapi.TahrirDatabase.add_issuer')
     @patch('tahrir_api.dbapi.TahrirDatabase.add_badge')
-    def setUp(self, fedmsg_init, add_issuer, add_badge):
-        hub = utils.MockHub()
-        self.consumer = fedbadges.consumers.FedoraBadgesConsumer(hub)
+    def setUp(self, add_issuer, add_badge):
+        self.consumer = fedbadges.consumers.FedoraBadgesConsumer()
 
     @patch('datanommer.models.Message.grep')
     @patch('tahrir_api.dbapi.TahrirDatabase.get_person')
